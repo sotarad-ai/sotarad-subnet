@@ -33,3 +33,6 @@ Thumbs.db
 
 # Local models
 models/
+
+# Validation database
+validator_scores.db

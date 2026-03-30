@@ -33,3 +33,20 @@ python3 register.py commit --network test --netuid 28 \
   --repo 0llheaven/Llama-3.2-11B-Vision-Radiology-mini \
   --revision b172c8c16b7a210f3b3fef77bc8d81f6f70fd9cc
 ```
+
+### Status of commit
+
+```
+python register.py status --network test --netuid 28 --coldkey sotarad-miner1-testnet --hotkey default
+```
+
+### Run validator
+
+```
+python3 validator.py \
+  --network test \
+  --netuid 28 \
+  --coldkey sotarad-vali1-testnet \
+  --hotkey default \
+  --allow-local
+```

@@ -27,12 +27,12 @@ Scoring V0 — flag only (see docs/ARCHITECTURE.md §4.4.3)
 - **Predicted negative** iff the parsed array is **[]**.
 - **Unparseable** reply → sample **skipped** for that miner (like a transport error).
 - **Ground truth positive** iff any `positive_finding` has
-  `condition ∈ TARGET_CONDITIONS` and `status == "active"`.
+  `condition ∈ EVAL_TARGET_CONDITIONS` and `status == "active"`.
 
 TP / FP / FN / TN and Fβ are computed from these study-level predictions.
 
-Default **TARGET_CONDITIONS** match `prompts/system_prompt.TARGET_CONDITIONS`
-(four lung conditions). Override with env `TARGET_CONDITIONS` or `--target-conditions`.
+``EVAL_TARGET_CONDITIONS`` is fixed in this file (keep aligned with
+``prompts/system_prompt.TARGET_CONDITIONS`` for miner prompt vocabulary).
 
 Tier incentives, duplicate policy, and dataset API contract are unchanged; see
 ARCHITECTURE.md and inline code.
@@ -60,10 +60,7 @@ from bittensor_wallet import Wallet
 
 from local_sglang import SglangSubprocessServer
 from prompts.response_parse import parse_findings_json_array
-from prompts.system_prompt import (
-    TARGET_CONDITIONS as PROMPT_TARGET_CONDITIONS,
-    build_chutes_messages,
-)
+from prompts.system_prompt import build_chutes_messages
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -76,13 +73,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Target condition config ───────────────────────────────────────────────────
-# Conditions (as in report_findings[].condition) that count as screen-positive
-# when status == "active". Default matches prompts/system_prompt.py.
-def _parse_target_conditions(raw: str) -> frozenset[str]:
-    if not raw.strip():
-        return frozenset(PROMPT_TARGET_CONDITIONS)
-    return frozenset(c.strip() for c in raw.split(",") if c.strip())
+# ── Dataset ground-truth labels ───────────────────────────────────────────────
+# ``report_findings.positive_findings[].condition`` must match exactly (case-sensitive).
+# Keep in sync with ``prompts/system_prompt.TARGET_CONDITIONS``.
+EVAL_TARGET_CONDITIONS: frozenset[str] = frozenset(
+    ("Pneumonia", "Tuberculosis", "Bronchitis", "Silicosis")
+)
 
 
 # ── Tier configuration ────────────────────────────────────────────────────────
@@ -392,12 +388,24 @@ def fetch_all_commits(
 
     commits: list[MinerCommit] = []
     for uid_key, data_str in raw.items():
-        try:
-            uid = int(uid_key)
-        except (ValueError, TypeError):
-            continue
+        # get_all_commitments() returns {ss58_hotkey: commitment_str}. Some paths may use int UID keys.
+        if isinstance(uid_key, int):
+            uid = uid_key
+        else:
+            key_str = str(uid_key).strip()
+            try:
+                uid = int(key_str)
+            except ValueError:
+                if key_str not in metagraph.hotkeys:
+                    logger.debug(
+                        "Skipping commitment: hotkey %s… not in metagraph (synced n=%s)",
+                        key_str[:16],
+                        metagraph.n,
+                    )
+                    continue
+                uid = metagraph.hotkeys.index(key_str)
 
-        if uid >= len(metagraph.hotkeys):
+        if uid < 0 or uid >= len(metagraph.hotkeys):
             continue
 
         hotkey = metagraph.hotkeys[uid]
@@ -535,7 +543,6 @@ async def fetch_eval_samples(
     dataset_base_url: str,
     dataset_api_key: str,
     image_base_url: str,
-    target_conditions: frozenset[str],
     after_ts: float,
     before_ts: float,
     limit: int = 100,
@@ -549,7 +556,7 @@ async def fetch_eval_samples(
                             "report_findings": { "positive_findings": [...] } } ] }
 
     Label is derived from positive_findings: 1 if any finding has
-    condition ∈ target_conditions AND status == "active", else 0.
+    condition ∈ ``EVAL_TARGET_CONDITIONS`` AND status == "active", else 0.
     """
     if not dataset_base_url:
         logger.warning("DATASET_BASE_URL not configured – skipping evaluation")
@@ -585,7 +592,7 @@ async def fetch_eval_samples(
             positive_findings = study.get("report_findings", {}).get("positive_findings", [])
 
             image_url = _resolve_image_url(image_field, image_base_url)
-            label       = _is_screen_positive(positive_findings, target_conditions)
+            label       = _is_screen_positive(positive_findings, EVAL_TARGET_CONDITIONS)
             timestamp   = _acquisition_date_to_ts(acq_date)
             demographics = study.get("patient_demographics") or {}
             if not isinstance(demographics, dict):
@@ -852,7 +859,6 @@ async def run_daily_evaluation(
     dataset_base_url: str,
     dataset_api_key: str,
     image_base_url: str,
-    target_conditions: frozenset[str],
     chutes_llm_url: str,
     chutes_api_key: str,
     chutes_timeout: int,
@@ -909,7 +915,6 @@ async def run_daily_evaluation(
         samples = await fetch_eval_samples(
             session, dataset_base_url, dataset_api_key,
             image_base_url=image_base_url,
-            target_conditions=target_conditions,
             after_ts=eval_start_ts,
             before_ts=eval_end_ts,
             limit=eval_samples_per_day,
@@ -1157,7 +1162,6 @@ async def validator_loop(
     dataset_base_url: str,
     dataset_api_key: str,
     image_base_url: str,
-    target_conditions: frozenset[str],
     chutes_llm_url: str,
     chutes_api_key: str,
     chutes_timeout: int,
@@ -1251,7 +1255,6 @@ async def validator_loop(
                         dataset_base_url=dataset_base_url,
                         dataset_api_key=dataset_api_key,
                         image_base_url=image_base_url,
-                        target_conditions=target_conditions,
                         chutes_llm_url=chutes_llm_url,
                         chutes_api_key=chutes_api_key,
                         chutes_timeout=chutes_timeout,
@@ -1330,8 +1333,6 @@ async def validator_loop(
               help="Bearer token for dataset API (if required)")
 @click.option("--image-base-url",       default=lambda: os.getenv("IMAGE_BASE_URL", ""),
               help="Base URL prepended to image_file filenames (e.g. https://data.sotarad.ai/images)")
-@click.option("--target-conditions",    default=lambda: os.getenv("TARGET_CONDITIONS", ""),
-              help="Comma-separated conditions for ground-truth screen-positive (default: four targets from prompts/system_prompt.py)")
 @click.option("--chutes-api-key",       default=lambda: os.getenv("CHUTES_API_KEY", ""),
               help="Chutes API key (cpk_...)")
 @click.option("--chutes-llm-url",       default=lambda: os.getenv("CHUTES_LLM_URL", "https://llm.chutes.ai/v1"),
@@ -1396,7 +1397,6 @@ def main(
     dataset_base_url: str,
     dataset_api_key: str,
     image_base_url: str,
-    target_conditions: str,
     chutes_api_key: str,
     chutes_llm_url: str,
     chutes_timeout: int,
@@ -1426,13 +1426,12 @@ def main(
         eval_delay_days  = 0  # bypass temporal filter so historical data is eligible
         logger.info("Mock mode: dataset=:8100  chutes=:8200  eval_delay_days=0")
 
-    parsed_conditions = _parse_target_conditions(target_conditions)
     sglang_argv = shlex.split(sglang_extra_args) if sglang_extra_args.strip() else []
     logger.info(
         f"Starting SotaRad validator | network={network} netuid={netuid} "
         f"β={fbeta_beta} eval_delay={eval_delay_days}d samples/day={eval_samples_per_day} "
         f"chutes_max_tokens={chutes_max_tokens} merge_system_into_user={chutes_merge_system_into_user} "
-        f"allow_local={allow_local} target_conditions={sorted(parsed_conditions)}"
+        f"allow_local={allow_local} eval_target_conditions={sorted(EVAL_TARGET_CONDITIONS)}"
     )
     asyncio.run(validator_loop(
         network=network,
@@ -1443,7 +1442,6 @@ def main(
         dataset_base_url=dataset_base_url,
         dataset_api_key=dataset_api_key,
         image_base_url=image_base_url,
-        target_conditions=parsed_conditions,
         chutes_llm_url=chutes_llm_url,
         chutes_api_key=chutes_api_key,
         chutes_timeout=chutes_timeout,
