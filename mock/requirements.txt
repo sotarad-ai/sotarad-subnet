@@ -4,12 +4,3 @@
 # API servers
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
-
-# Inference (mock/chutes.py)
-transformers>=4.45.0   # mllama support added in 4.45
-torch>=2.1.0
-pillow>=10.0.0
-requests>=2.31.0
-accelerate>=0.27.0     # device_map="auto"
-bitsandbytes>=0.43.0   # optional: only needed if re-quantising; model is pre-quantised
-huggingface-hub>=0.22.0
