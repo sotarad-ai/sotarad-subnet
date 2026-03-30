@@ -23,6 +23,9 @@ Extra CLI flags for ``launch_server`` (same idea as ``--sglang-extra-args``)::
 After “ready”, open another terminal and e.g.::
 
     python3 tests/test_model_request.py --image x.png --host 127.0.0.1 --port 40035
+
+To **download** from Hugging Face first, then host the same way the validator uses a local dir, use
+``tests/download_and_host_sglang.py``.
 """
 
 from __future__ import annotations
