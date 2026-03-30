@@ -676,7 +676,7 @@ async def evaluate_miner(
             tasks = [
                 query_vision_completion(
                     session,
-                    server.base_url,
+                    server.client_base_url,
                     "",
                     commit.repo,
                     s.image_url,
