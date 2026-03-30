@@ -30,3 +30,6 @@ wallets/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local models
+models/
