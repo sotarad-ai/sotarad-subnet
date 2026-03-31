@@ -2,6 +2,7 @@
 
 Netuid: 28
 
+```
 Wallets
 ├── Coldkey sotarad-owner-testnet  ss58_address 5F9CjnR1QcWncCYqvaYH4D8LyzLFa5nczjVFVr5sDJhsVBWp
 │   └── Hotkey default  ss58_address 5CRhbeXLvHPMq1DenC6S8QjjCauzPtpfiZ2tpeJJPLSsQx4u
@@ -41,7 +42,7 @@ Wallets
 │       
 └── Coldkey sotarad-miner10-testnet  ss58_address 5HB2sm9B3ZJ2XNv8WhrpzBfuQiimxfoXkdk5jFKfKNQt4ccH
     └── Hotkey default  ss58_address 5DEthjjznK87qdBcysGaDP5qENAmRs15W1WAxJ79zwys3YQw
-
+```
 
 ## How to reproduce testnet results
 
