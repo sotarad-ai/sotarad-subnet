@@ -49,7 +49,7 @@ def _build_app(data_dir: Path) -> FastAPI:
         print(f"[mock/dataset_api] Loaded {len(studies)} studies from {results_path}")
 
     # Override acquisition_date to tomorrow so studies always pass the
-    # validator's per-miner temporal filter when eval_delay_days=0.
+    # validator's per-miner temporal filter when eval_delay_minutes=0.
     TOMORROW = (date.today() + timedelta(days=1)).isoformat()
 
     @app.get("/studies")

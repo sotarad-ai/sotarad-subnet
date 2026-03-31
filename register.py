@@ -381,7 +381,7 @@ def status(
     click.echo(f"  Committed {blocks_old} blocks ago (~{age_h}h {age_m}m)")
     click.echo(
         "  Evaluation eligibility is controlled by the validator's "
-        "EVAL_DELAY_DAYS setting (default: 1 day after submission)."
+        "EVAL_DELAY_MINUTES setting (default: 1440 ≈ one day after submission)."
     )
 
 

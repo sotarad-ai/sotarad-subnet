@@ -34,6 +34,11 @@ TP / FP / FN / TN and Fβ are computed from these study-level predictions.
 ``EVAL_TARGET_CONDITIONS`` is fixed in this file (keep aligned with
 ``prompts/system_prompt.TARGET_CONDITIONS`` for miner prompt vocabulary).
 
+Evaluation **period** (default 1440 minutes): ``period_id = floor(unix_timestamp //
+(60 * eval_period_minutes))``. SQLite ``eval_date`` stores zero-padded ``period_id``.
+Commit eligibility and per-miner sample cutoffs use absolute unix times
+(``eval_delay_minutes``). Tier ``lookback_days`` is converted to a number of periods.
+
 Tier incentives, duplicate policy, and dataset API contract are unchanged; see
 ARCHITECTURE.md and inline code.
 """
@@ -43,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import shlex
 import sqlite3
@@ -50,7 +56,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
@@ -132,7 +138,7 @@ class EvalSample:
 @dataclass
 class EvalResult:
     uid: int
-    eval_date: str    # "YYYY-MM-DD"
+    eval_date: str    # zero-padded eval period id (see format_eval_period_key)
     tp: int
     fp: int
     fn: int
@@ -149,6 +155,7 @@ class EvalResult:
 
 def init_db(db_path: str) -> None:
     with sqlite3.connect(db_path) as con:
+        # eval_date stores format_eval_period_key(period_id), not calendar dates.
         con.execute("""
             CREATE TABLE IF NOT EXISTS daily_scores (
                 uid              INTEGER NOT NULL,
@@ -213,13 +220,28 @@ def query_scores_for_uid(
     return [dict(r) for r in rows]
 
 
-def eval_already_ran_today(db_path: str, eval_date: str) -> bool:
+def eval_already_ran_for_period(db_path: str, eval_period_key: str) -> bool:
     with sqlite3.connect(db_path) as con:
         row = con.execute(
             "SELECT COUNT(*) FROM daily_scores WHERE eval_date = ?",
-            (eval_date,),
+            (eval_period_key,),
         ).fetchone()
     return row[0] > 0
+
+
+def eval_period_seconds(eval_period_minutes: int) -> int:
+    """Length of one evaluation period in seconds (minimum 60s)."""
+    return max(60, int(eval_period_minutes) * 60)
+
+
+def eval_period_id_at(timestamp: float, period_s: int) -> int:
+    """Floor bucket: ``int(timestamp) // period_s``."""
+    return int(timestamp) // period_s
+
+
+def format_eval_period_key(period_id: int) -> str:
+    """Lexicographic sort matches numeric order (fixed width)."""
+    return f"{period_id:012d}"
 
 
 # ── Chain helpers ─────────────────────────────────────────────────────────────
@@ -484,18 +506,22 @@ def deduplicate_commits(commits: list[MinerCommit]) -> list[MinerCommit]:
 
 def filter_eligible(
     commits: list[MinerCommit],
-    eval_delay_days: int,
+    eval_delay_minutes: int,
 ) -> list[MinerCommit]:
     """
-    Keep only commits whose submission timestamp is at least eval_delay_days
-    before now (i.e. the model could not have been trained on today's data).
-    First eligible evaluation day is D+1 per ARCHITECTURE.md §2.3.
+    Keep only commits whose on-chain submission time is strictly before
+    ``now - eval_delay_minutes`` (absolute unix time).
     """
-    cutoff_ts = time.time() - eval_delay_days * 86_400
+    delay_s = max(0, int(eval_delay_minutes)) * 60
+    cutoff_ts = time.time() - delay_s
     eligible = [c for c in commits if c.commit_ts < cutoff_ts]
     excluded = len(commits) - len(eligible)
     if excluded:
-        logger.info(f"{excluded} miner(s) excluded: committed too recently (< {eval_delay_days}d ago)")
+        logger.info(
+            "%s miner(s) excluded: committed too recently (< %s min before now)",
+            excluded,
+            eval_delay_minutes,
+        )
     return eligible
 
 
@@ -743,7 +769,7 @@ async def evaluate_miner(
     chutes_max_tokens: int,
     chutes_merge_system_into_user: bool,
     beta: float,
-    eval_date: str,
+    eval_period_key: str,
     *,
     allow_local: bool,
     local_sglang_host: str,
@@ -839,7 +865,7 @@ async def evaluate_miner(
     stored_chute_id = commit.chute_id.strip() or f"local:{commit.repo}"
     return EvalResult(
         uid=commit.uid,
-        eval_date=eval_date,
+        eval_date=eval_period_key,
         tp=tp, fp=fp, fn=fn, tn=tn,
         sample_count=evaluated,
         fb_score=fb,
@@ -866,7 +892,9 @@ async def run_daily_evaluation(
     chutes_merge_system_into_user: bool,
     chutes_max_concurrent: int,
     eval_samples_per_day: int,
-    eval_delay_days: int,
+    eval_period_minutes: int,
+    eval_delay_minutes: int,
+    eval_period_key: str,
     beta: float,
     *,
     allow_local: bool,
@@ -876,13 +904,17 @@ async def run_daily_evaluation(
     sglang_startup_timeout: float,
 ) -> tuple[list[MinerCommit], dict[int, int]]:
     """
-    One complete daily evaluation pass.
+    One evaluation pass for the current eval period (unix bucket).
 
     Returns eligible commits and a UID → parameter-count map from Hugging Face
     (for tier tie-breaks only; not from chain).
     """
-    today = date.today().isoformat()
-    logger.info(f"=== Daily evaluation starting for {today} ===")
+    period_s = eval_period_seconds(eval_period_minutes)
+    logger.info(
+        "=== Evaluation pass starting | period_key=%s (period_len=%s min) ===",
+        eval_period_key,
+        eval_period_minutes,
+    )
 
     # 1. Discover all miner commitments
     commits = await asyncio.to_thread(
@@ -897,19 +929,20 @@ async def run_daily_evaluation(
     # 2. Dedup: only the earliest submitter per (repo, revision) is eligible
     eligible = deduplicate_commits(commits)
 
-    # 3. Temporal filter: submission must predate today by at least eval_delay_days
-    eligible = filter_eligible(eligible, eval_delay_days)
-    logger.info(f"{len(eligible)} miner(s) eligible for today's evaluation")
+    # 3. Temporal filter: commit_ts must be older than eval_delay_minutes (absolute time)
+    eligible = filter_eligible(eligible, eval_delay_minutes)
+    logger.info("%s miner(s) eligible for this evaluation pass", len(eligible))
 
     if not eligible:
         logger.info("No eligible miners – skipping inference pass")
         return eligible, {}
 
-    # 4. Fetch labelled evaluation samples from the public dataset API
-    #    Window: last 24 h (today's window); each miner also filtered by its own cutoff below
-    now           = time.time()
-    eval_end_ts   = now
-    eval_start_ts = now - 86_400
+    # 4. Fetch labelled evaluation samples — window = current eval period so far
+    #    [period_id * period_s, min(now, (period_id+1)*period_s)); period_id from bucket key
+    now_ts = time.time()
+    period_id = int(eval_period_key)
+    eval_start_ts = period_id * period_s
+    eval_end_ts = min(now_ts, (period_id + 1) * period_s)
 
     async with aiohttp.ClientSession() as session:
         samples = await fetch_eval_samples(
@@ -933,7 +966,7 @@ async def run_daily_evaluation(
         local_slot = asyncio.Semaphore(1)
 
         async def _eval_one(commit: MinerCommit) -> Optional[EvalResult]:
-            miner_cutoff = commit.commit_ts + eval_delay_days * 86_400
+            miner_cutoff = commit.commit_ts + max(0, int(eval_delay_minutes)) * 60
             miner_samples = [s for s in samples if s.timestamp > miner_cutoff]
             if not miner_samples:
                 logger.debug(
@@ -954,7 +987,7 @@ async def run_daily_evaluation(
                         chutes_max_tokens,
                         chutes_merge_system_into_user,
                         beta,
-                        today,
+                        eval_period_key,
                         allow_local=allow_local,
                         local_sglang_host=local_sglang_host,
                         local_sglang_port=local_sglang_port,
@@ -972,7 +1005,7 @@ async def run_daily_evaluation(
                     chutes_max_tokens,
                     chutes_merge_system_into_user,
                     beta,
-                    today,
+                    eval_period_key,
                     allow_local=allow_local,
                     local_sglang_host=local_sglang_host,
                     local_sglang_port=local_sglang_port,
@@ -989,7 +1022,7 @@ async def run_daily_evaluation(
             await asyncio.to_thread(upsert_daily_score, db_path, r)
             saved += 1
 
-    logger.info(f"=== Daily evaluation complete: {saved}/{len(eligible)} miners scored ===")
+    logger.info("=== Evaluation pass complete: %s/%s miners scored ===", saved, len(eligible))
 
     uid_params = await asyncio.to_thread(resolve_uid_parameter_counts, eligible)
     return eligible, uid_params
@@ -997,25 +1030,26 @@ async def run_daily_evaluation(
 
 # ── Tier engine ───────────────────────────────────────────────────────────────
 
-def _lookback_date_range(today: str, lookback_days: int) -> tuple[str, str]:
+def _lookback_period_keys(
+    current_period_id: int,
+    lookback_days: int,
+    eval_period_minutes: int,
+) -> tuple[str, str]:
     """
-    Return (since_date, today) covering exactly lookback_days calendar days.
-
-    Convention (fixed globally per ARCHITECTURE.md §5.2): the window **includes
-    today's scores** (i.e. the k days are today, yesterday, … today-(k-1)).
-    If today's evaluation has not yet run, the DB simply returns no row for
-    today and the mean is computed from the available completed days only.
+    Map nominal tier ``lookback_days`` to a contiguous range of eval period keys
+    ending at ``current_period_id``. Uses ``ceil(days * 24h / period_len)`` periods.
     """
-    d     = date.fromisoformat(today)
-    since = d - timedelta(days=lookback_days - 1)
-    return since.isoformat(), today
+    n_periods = max(1, math.ceil(lookback_days * 24 * 60 / eval_period_minutes))
+    since_pid = current_period_id - (n_periods - 1)
+    return format_eval_period_key(since_pid), format_eval_period_key(current_period_id)
 
 
 def compute_tier_weights(
     db_path: str,
     eligible_commits: list[MinerCommit],
     tiers: list[TierConfig],
-    today: str,
+    current_period_id: int,
+    eval_period_minutes: int,
     uid_param_counts: dict[int, int],
 ) -> dict[int, float]:
     """
@@ -1028,13 +1062,15 @@ def compute_tier_weights(
     emissions: dict[int, float] = {uid: 0.0 for uid in eligible_uids}
 
     for tier in tiers:
-        since_date, until_date = _lookback_date_range(today, tier.lookback_days)
+        since_key, until_key = _lookback_period_keys(
+            current_period_id, tier.lookback_days, eval_period_minutes
+        )
 
         # Build aggregate Fβ (mean) over the lookback window for each UID
         # Ranking tuple: (-mean_fb, -mean_recall, -mean_precision, params, commit_block)
         ranked: list[tuple[float, float, float, int, int, int]] = []
         for uid in eligible_uids:
-            scores = query_scores_for_uid(db_path, uid, since_date, until_date)
+            scores = query_scores_for_uid(db_path, uid, since_key, until_key)
             if not scores:
                 continue
             n          = len(scores)
@@ -1047,7 +1083,12 @@ def compute_tier_weights(
             ranked.append((mean_fb, mean_rec, mean_prec, params_tb, c.commit_block, uid))
 
         if not ranked:
-            logger.debug(f"Tier {tier.name}: no UIDs with scores in [{since_date}, {until_date}]")
+            logger.debug(
+                "Tier %s: no UIDs with scores in period range [%s, %s]",
+                tier.name,
+                since_key,
+                until_key,
+            )
             continue
 
         # Sort by tie-breaking rules (§6): higher Fβ > recall > precision > fewer params > earlier block
@@ -1069,8 +1110,12 @@ def compute_tier_weights(
             logger.debug(f"Tier {tier.name}: UID {uid} += {share_per_uid:.4f}")
 
         logger.info(
-            f"Tier {tier.name}: {len(qualifiers)} qualifier(s) | "
-            f"{share_per_uid:.4f} each | window [{since_date}, {until_date}]"
+            "Tier %s: %s qualifier(s) | %.4f each | period window [%s, %s]",
+            tier.name,
+            len(qualifiers),
+            share_per_uid,
+            since_key,
+            until_key,
         )
 
     return emissions
@@ -1086,6 +1131,7 @@ async def set_weights_from_tiers(
     tiers: list[TierConfig],
     eligible_commits: list[MinerCommit],
     uid_param_counts: dict[int, int],
+    eval_period_minutes: int,
 ) -> bool:
     """Derive weights from tier emissions and submit them on chain."""
     async def _burn_to_uid0(reason: str) -> bool:
@@ -1099,13 +1145,16 @@ async def set_weights_from_tiers(
     if not eligible_commits:
         return await _burn_to_uid0("No eligible commits")
 
-    today     = date.today().isoformat()
+    now_ts = time.time()
+    period_s = eval_period_seconds(eval_period_minutes)
+    current_period_id = eval_period_id_at(now_ts, period_s)
     emissions = await asyncio.to_thread(
         compute_tier_weights,
         db_path,
         eligible_commits,
         tiers,
-        today,
+        current_period_id,
+        eval_period_minutes,
         uid_param_counts,
     )
 
@@ -1169,7 +1218,8 @@ async def validator_loop(
     chutes_merge_system_into_user: bool,
     chutes_max_concurrent: int,
     eval_samples_per_day: int,
-    eval_delay_days: int,
+    eval_period_minutes: int,
+    eval_delay_minutes: int,
     beta: float,
     tiers: list[TierConfig],
     heartbeat_timeout: int,
@@ -1215,9 +1265,10 @@ async def validator_loop(
 
         # ── State ─────────────────────────────────────────────────────────────
         last_weight_block: int        = 0
-        last_eval_date:    str        = ""
+        last_eval_period_key: str     = ""
         eligible_commits:  list[MinerCommit] = []
         uid_param_counts:  dict[int, int]    = {}
+        period_s_loop = eval_period_seconds(eval_period_minutes)
 
         # Pre-populate eligible_commits from chain so weight-setting works immediately
         current_block = await asyncio.to_thread(subtensor.get_current_block)
@@ -1229,7 +1280,7 @@ async def validator_loop(
             current_block,
             allow_local=allow_local,
         )
-        eligible_commits = filter_eligible(deduplicate_commits(commits), eval_delay_days)
+        eligible_commits = filter_eligible(deduplicate_commits(commits), eval_delay_minutes)
         uid_param_counts = await asyncio.to_thread(
             resolve_uid_parameter_counts, eligible_commits
         )
@@ -1240,36 +1291,42 @@ async def validator_loop(
                 await asyncio.to_thread(metagraph.sync, subtensor=subtensor)
                 current_block      = await asyncio.to_thread(subtensor.get_current_block)
                 last_heartbeat[0]  = time.time()
-                today              = date.today().isoformat()
+                now_ts = time.time()
+                period_key = format_eval_period_key(eval_period_id_at(now_ts, period_s_loop))
 
-                # ── Daily evaluation trigger ──────────────────────────────────
-                already_ran = await asyncio.to_thread(eval_already_ran_today, db_path, today)
-                if today != last_eval_date and not already_ran:
-                    last_eval_date   = today  # set before to avoid tight-loop retries on failure
-                    eligible_commits, uid_param_counts = await run_daily_evaluation(
-                        subtensor=subtensor,
-                        metagraph=metagraph,
-                        netuid=netuid,
-                        current_block=current_block,
-                        db_path=db_path,
-                        dataset_base_url=dataset_base_url,
-                        dataset_api_key=dataset_api_key,
-                        image_base_url=image_base_url,
-                        chutes_llm_url=chutes_llm_url,
-                        chutes_api_key=chutes_api_key,
-                        chutes_timeout=chutes_timeout,
-                        chutes_max_tokens=chutes_max_tokens,
-                        chutes_merge_system_into_user=chutes_merge_system_into_user,
-                        chutes_max_concurrent=chutes_max_concurrent,
-                        eval_samples_per_day=eval_samples_per_day,
-                        eval_delay_days=eval_delay_days,
-                        beta=beta,
-                        allow_local=allow_local,
-                        local_sglang_host=local_sglang_host,
-                        local_sglang_port=local_sglang_port,
-                        sglang_extra_argv=sglang_extra_argv,
-                        sglang_startup_timeout=sglang_startup_timeout,
+                # ── Evaluation pass (once per eval period) ───────────────────
+                if period_key != last_eval_period_key:
+                    last_eval_period_key = period_key
+                    already_ran = await asyncio.to_thread(
+                        eval_already_ran_for_period, db_path, period_key
                     )
+                    if not already_ran:
+                        eligible_commits, uid_param_counts = await run_daily_evaluation(
+                            subtensor=subtensor,
+                            metagraph=metagraph,
+                            netuid=netuid,
+                            current_block=current_block,
+                            db_path=db_path,
+                            dataset_base_url=dataset_base_url,
+                            dataset_api_key=dataset_api_key,
+                            image_base_url=image_base_url,
+                            chutes_llm_url=chutes_llm_url,
+                            chutes_api_key=chutes_api_key,
+                            chutes_timeout=chutes_timeout,
+                            chutes_max_tokens=chutes_max_tokens,
+                            chutes_merge_system_into_user=chutes_merge_system_into_user,
+                            chutes_max_concurrent=chutes_max_concurrent,
+                            eval_samples_per_day=eval_samples_per_day,
+                            eval_period_minutes=eval_period_minutes,
+                            eval_delay_minutes=eval_delay_minutes,
+                            eval_period_key=period_key,
+                            beta=beta,
+                            allow_local=allow_local,
+                            local_sglang_host=local_sglang_host,
+                            local_sglang_port=local_sglang_port,
+                            sglang_extra_argv=sglang_extra_argv,
+                            sglang_startup_timeout=sglang_startup_timeout,
+                        )
 
                 # ── Weight-setting trigger ────────────────────────────────────
                 blocks_since_weights = current_block - last_weight_block
@@ -1286,6 +1343,7 @@ async def validator_loop(
                         tiers=tiers,
                         eligible_commits=eligible_commits,
                         uid_param_counts=uid_param_counts,
+                        eval_period_minutes=eval_period_minutes,
                     )
                     if success:
                         last_weight_block = current_block
@@ -1350,9 +1408,19 @@ async def validator_loop(
 @click.option("--chutes-max-concurrent",type=int, default=lambda: int(os.getenv("CHUTES_MAX_CONCURRENT", "4")),
               help="Max parallel miner evaluations")
 @click.option("--eval-samples-per-day", type=int, default=lambda: int(os.getenv("EVAL_SAMPLES_PER_DAY", "100")),
-              help="Max dataset samples fetched per daily evaluation")
-@click.option("--eval-delay-days",      type=int, default=lambda: int(os.getenv("EVAL_DELAY_DAYS", "1")),
-              help="Min days after model submission before it qualifies for evaluation")
+              help="Max dataset samples fetched per evaluation pass")
+@click.option(
+    "--eval-period-minutes",
+    type=int,
+    default=lambda: int(os.getenv("EVAL_PERIOD_MINUTES", "1440")),
+    help="Evaluation period length in minutes (default 1440 = 24h). Period id = floor(unix_ts / (60*minutes)).",
+)
+@click.option(
+    "--eval-delay-minutes",
+    type=int,
+    default=lambda: int(os.getenv("EVAL_DELAY_MINUTES", "1440")),
+    help="Min minutes after on-chain commit before a miner is evaluated (default 1440 ≈ former 1 day).",
+)
 @click.option("--fbeta-beta",           type=float, default=lambda: float(os.getenv("FBETA_BETA", "2.0")),
               help="β parameter for Fβ scoring (>1 weights recall more than precision)")
 @click.option("--heartbeat-timeout",    type=int, default=lambda: int(os.getenv("HEARTBEAT_TIMEOUT", "600")),
@@ -1404,7 +1472,8 @@ def main(
     chutes_separate_system: bool,
     chutes_max_concurrent: int,
     eval_samples_per_day: int,
-    eval_delay_days: int,
+    eval_period_minutes: int,
+    eval_delay_minutes: int,
     fbeta_beta: float,
     heartbeat_timeout: int,
     allow_local: bool,
@@ -1423,13 +1492,14 @@ def main(
         image_base_url   = image_base_url   or "http://localhost:8100/images"
         chutes_llm_url   = "http://localhost:8200/v1"
         chutes_api_key   = chutes_api_key   or "mock-key"
-        eval_delay_days  = 0  # bypass temporal filter so historical data is eligible
-        logger.info("Mock mode: dataset=:8100  chutes=:8200  eval_delay_days=0")
+        eval_delay_minutes = 0  # bypass temporal filter so historical data is eligible
+        logger.info("Mock mode: dataset=:8100  chutes=:8200  eval_delay_minutes=0")
 
     sglang_argv = shlex.split(sglang_extra_args) if sglang_extra_args.strip() else []
     logger.info(
         f"Starting SotaRad validator | network={network} netuid={netuid} "
-        f"β={fbeta_beta} eval_delay={eval_delay_days}d samples/day={eval_samples_per_day} "
+        f"β={fbeta_beta} eval_period={eval_period_minutes}m eval_delay={eval_delay_minutes}m "
+        f"samples/pass={eval_samples_per_day} "
         f"chutes_max_tokens={chutes_max_tokens} merge_system_into_user={chutes_merge_system_into_user} "
         f"allow_local={allow_local} eval_target_conditions={sorted(EVAL_TARGET_CONDITIONS)}"
     )
@@ -1449,7 +1519,8 @@ def main(
         chutes_merge_system_into_user=chutes_merge_system_into_user,
         chutes_max_concurrent=chutes_max_concurrent,
         eval_samples_per_day=eval_samples_per_day,
-        eval_delay_days=eval_delay_days,
+        eval_period_minutes=eval_period_minutes,
+        eval_delay_minutes=eval_delay_minutes,
         beta=fbeta_beta,
         tiers=DEFAULT_TIERS,
         heartbeat_timeout=heartbeat_timeout,

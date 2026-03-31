@@ -27,17 +27,36 @@ Wallets
 ### Register miner model
 
 ```
-cd /workspace/sotarad-subnet
 python3 register.py commit --network test --netuid 28 \
   --coldkey sotarad-miner1-testnet --hotkey default \
   --repo 0llheaven/Llama-3.2-11B-Vision-Radiology-mini \
   --revision b172c8c16b7a210f3b3fef77bc8d81f6f70fd9cc
 ```
 
+```
+python3 register.py commit --network test --netuid 28 \
+  --coldkey sotarad-miner2-testnet --hotkey default \
+  --repo 0llheaven/Llama-3.2-11B-Vision-Radiology-mini \
+  --revision b172c8c16b7a210f3b3fef77bc8d81f6f70fd9cc
+```
+
+```
+python3 register.py commit --network test --netuid 28 \
+  --coldkey sotarad-miner3-testnet --hotkey default \
+  --repo Qwen/Qwen3.5-4B \
+  --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+```
+
 ### Status of commit
 
 ```
 python register.py status --network test --netuid 28 --coldkey sotarad-miner1-testnet --hotkey default
+```
+
+### Mock Data API
+
+```
+python3 mock/dataset_api.py --port 8100 --data-dir ./data
 ```
 
 ### Run validator
@@ -48,5 +67,7 @@ python3 validator.py \
   --netuid 28 \
   --coldkey sotarad-vali1-testnet \
   --hotkey default \
-  --allow-local
+  --eval-period-minutes 10 \
+  --allow-local \
+  --mock
 ```
